@@ -95,6 +95,34 @@ curl -H "Authorization: Bearer REDACTED_API_TOKEN" ...
 - 写入原子(temp + `mv`);文件损坏则移到 `redact.enc.corrupt-<ms>` 并空启动。
 - **fail-closed**:解密失败、keyring 不可用时,提示被扣留/工具调用被拒绝,绝不放行明文。
 
+## 自动涂改词表(可选)
+
+自动检测只认形状(邮箱、API key 等)。客户名、产品名、项目编号这类词要手动 `redact NAME=value` 注册,且每个新会话都要重新注册。不想每次手贴,可以用启动包装:把词表存成文件,启动时作为第一条提示自动注入。
+
+1. 建词表 `~/.claude/redact-seed.txt`:
+
+   ```
+   redact CLIENT_NAME=Acme Corp
+   PRODUCT_NAME=WidgetPro
+   PROJECT_NO=PRJ-2024-001
+   ```
+
+   首行必须以 `redact` 开头,后续行 `NAME=值` 每行一条。
+
+2. 在 `~/.bashrc`(或 `~/.zshrc`)加函数:
+
+   ```bash
+   claude-r() { claude "$(cat ~/.claude/redact-seed.txt)"; }
+   ```
+
+3. 新会话用 `claude-r` 启动:第一条提示被插件拦截、注册全部词表、drop 不进模型;之后对话里这些词自动遮蔽。
+
+注意:
+
+- 词表是**明文**,只放中低敏感词(客户名、项目编号)。真密钥请走会话内 `redact` 命令,走加密的 `redact.enc`。
+- 注入的提示原文会进会话 `.jsonl`(prompt queue 记录)——同上,词表不要含真密钥。
+- `--resume` 续旧会话不需要注入(映射表已在 `redact.enc` 里),用普通 `claude` 即可;`claude-r` 只用于开新会话。
+
 ## 限制
 
 - 权限对话框显示的是命令真实执行形态(含真实值,仅你的终端可见)。
