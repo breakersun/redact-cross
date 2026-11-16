@@ -13,6 +13,36 @@ Claude Code 的会话级密钥/PII 遮蔽插件(mod)。模型只看到 `REDACTED
 | `prompt.submit` | `redact NAME=value` 命令被拦截、不发给模型,值存入会话。其他提示中的已知值和自动检测到的敏感值替换为占位符。 |
 | `tool.call` | 工具参数中的占位符在执行前换回真实值;工具输出中的真实值在返回模型前换回占位符。 |
 
+## 工作过程时序图
+
+```mermaid
+sequenceDiagram
+    actor U as 用户
+    participant A as Agent(Claude Code + redact mod)
+    participant S as 存储(redact.enc + keyring)
+    participant L as LLM API
+    participant T as 工具(Bash/MCP/…)
+
+    U->>A: redact DB_PASS=hunter2
+    Note over A: 拦截, 不发给模型<br/>登记 REDACTED_DB_PASS → hunter2
+    A->>S: 加密落盘(AES-256-CBC, 密钥在 keyring)
+
+    U->>A: 用 REDACTED_DB_PASS 调 xxx API
+    Note over A: 涂改 conceal:<br/>已知值 + 自动检测 → 占位符
+    A->>L: 提示(只含占位符, 真值不出去)
+    L-->>A: 决定调用 Bash<br/>curl -H "Bearer REDACTED_DB_PASS"
+    Note over A: 恢复 reveal:<br/>占位符 → 真实值
+    A->>T: 执行 curl(带真实值)
+    T-->>A: 输出(含真实值)
+    Note over A: 涂改 conceal:<br/>真实值 → 占位符
+    A-->>L: 工具结果(只含占位符)
+    L-->>U: 回复(只含占位符)
+
+    Note over U,S: claude --resume:按 session id 找到 redact.enc,<br/>解密载入, 映射原样恢复<br/>/clear 或新会话:新 id, 空白开始
+```
+
+不变式:LLM API 收发的一切字符串都不含真实值;真实值只在 Agent 进程内存和加密存储之间流转。
+
 ## 安装
 
 1. 系统依赖(WSL 内):
