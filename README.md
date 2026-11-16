@@ -1,153 +1,96 @@
 # redact-cross
 
-Cross-platform port of
-[scriptease/claude-code-redact-plugin](https://github.com/scriptease/claude-code-redact-plugin)
-(baseline `ff47998`, 2026-11-15): session-scoped secret redaction for Claude Code
-on WSL/Linux and Windows. The upstream stores its encryption key in the macOS
-Keychain; this port swaps in a platform keyring backend (Secret Service on
-Linux, DPAPI on Windows). Upstream carries no LICENSE; all credit and copyright
-for the original work belongs to [scriptease](https://github.com/scriptease)
-([backstory](https://scriptease.dev/posts/2026-09-05-redacted/)).
+Claude Code 的会话级密钥/PII 遮蔽插件(mod)。模型只看到 `REDACTED_<NAME>` 占位符;真实值只在工具执行时到达工具,从不进入模型上下文。
 
-## Port status
+**目前仅支持 WSL(Linux)**;Windows、macOS 支持在路线图中。
 
-- [x] upstream snapshot imported (`ff47998`)
-- [x] `keyOf()` Secret Service (Linux/WSL) backend — backend probed via
-      `sh -c command -v`; `security` first, then `secret-tool` (libsecret-tools).
-      Key hex reaches both CLIs over stdin, openssl through `REDACT_KEY` env —
-      never argv.
-- [x] cross-platform openssl invocation — `openssl` resolved through PATH
-      instead of the hardcoded `/usr/bin/openssl`; ciphertext of a Homebrew
-      3.x openssl decrypts with /usr/bin/openssl 3.0 and vice versa (verified).
-- [ ] `keyOf()` DPAPI (Windows) backend
-- [ ] Windows: `mv`/atomic rename via PowerShell or engine fs primitives
-- [ ] Windows end-to-end test
+需要 Claude Code v2.1.287+(mods 默认开启)。
 
-Validated on Ubuntu 24.04 (WSL2, systemd, gnome-keyring unlocked):
-`secret-tool` store/lookup/clear non-interactive, openssl roundtrip both ways,
-plugin test suite 78/78 pass. One environment caveat: after `wsl --shutdown`,
-the Secret Service keyring must still be unlocked without an interactive
-prompt — if it ever locks, hooks fail closed (session runs from memory) rather
-than leaking.
+## 工作原理
 
----
+| 事件 | 行为 |
+|---|---|
+| `prompt.submit` | `redact NAME=value` 命令被拦截、不发给模型,值存入会话。其他提示中的已知值和自动检测到的敏感值替换为占位符。 |
+| `tool.call` | 工具参数中的占位符在执行前换回真实值;工具输出中的真实值在返回模型前换回占位符。 |
 
-# redact (upstream README)
+## 安装
 
-Backstory: [Redacted](https://scriptease.dev/posts/2026-09-05-redacted/).
+1. 系统依赖(WSL 内):
 
-Session-scoped redaction middleware, built as a Claude Code
-[mod](https://code.claude.com/docs/en/plugins/mods/overview) (`hooks/redact.ts`).
-Needs Claude Code v2.1.287 or later; mods are on by default. The model sees `REDACTED_<NAME>` placeholders; tools get
-the real values.
+   ```
+   sudo apt install -y libsecret-tools   # secret-tool, 密钥存 gnome-keyring
+   ```
 
-## Install
+   `openssl`(PATH 内任意 1.1.1+/3.x)和 `mv` 系统自带。
+
+2. 安装插件:
+
+   ```
+   claude plugin install redact --marketplace breakersun/redact-cross
+   ```
+
+   仅当前项目:`--scope local`。
+
+## 使用
 
 ```
-claude plugin install redact --marketplace scriptease/claude-code-redact-plugin            # everywhere
-claude plugin install redact --marketplace scriptease/claude-code-redact-plugin --scope local  # this project only
+redact DB_PASS=hunter2                  # 存一个(值 ≥4 字符, 引号自动剥离)
+redact API_TOKEN: "abc..."              # = 或 : 均可; 一条提示可存多行
+redact list                             # 列出当前占位符
+redact forget API_TOKEN                 # 删除一个
+redact clear                            # 全部删除; 自动检测的误报项会回显给模型
+redact clear --force                    # 全部删除; 所有值回显给模型
 ```
 
-## Flow
-
-| Event           | What happens                                                                                  |
-| --------------- | --------------------------------------------------------------------------------------------- |
-| `prompt.submit` | `redact NAME=value` prompts are dropped and stored. Other prompts: known values and auto-detected PII become placeholders; a note tells the model how to use them. |
-| `tool.call`     | Placeholders in tool arguments (Bash command, file content, MCP args, ...) are replaced with the real values before the tool runs. Real values in the tool result are replaced with placeholders before the model reads it. |
-
-## Storage
-
-Secrets are bound to the session and survive a restart of the Claude process,
-a `/reload-plugins` and a `--resume` days later. That is what headless hosts
-(Agent SDK, T3 Code, `claude -p`) need: the process may be gone between turns.
-
-- File: `~/.claude/projects/<project>/<session id>/redact.enc`, next to the
-  transcript, written after every hook call that added a value (temp file,
-  then `mv`, so a killed process leaves the previous file intact).
-- Encryption: `/usr/bin/openssl` AES-256-CBC with PBKDF2. The mod runtime's
-  `crypto.subtle` only offers `digest`. The session id is stored inside and
-  checked on load.
-- Key: one 256-bit key for all sessions in the login Keychain
-  (`claude-code-redact` / `aes-key`), created on first use. It reaches
-  `security` over stdin and `openssl` through its environment, never argv.
-- A fork, `/branch` or `/clear` starts a new session id and starts empty.
-- An unreadable file is moved to `redact.enc.corrupt-<ms>`; the session starts
-  empty and old placeholders stay unresolved (fail-closed).
-
-## Usage
+之后直接在提示里用占位符:
 
 ```
-redact DB_PASS=hunter2                  # store one (value: 4+ chars, quotes stripped)
-redact API_TOKEN: "abc..."              # `=` or `:`; several NAME=value lines per prompt
-redact list                             # placeholders currently stored
-redact forget API_TOKEN                 # drop one
-redact clear                            # drop all; tell the model which were false positives
-redact clear --force                    # drop all; tell the model every value
+curl -H "Authorization: Bearer REDACTED_API_TOKEN" ...
 ```
 
-`redact clear` re-checks each auto-detected entry against the current detectors.
-Entries they would no longer store (ordinary words, code, values under a
-placeholder-bearing key) go to the model with your next prompt as
-`REDACTED_X = "value"`, so it can read earlier messages again. Real secrets and
-`redact NAME=value` entries are dropped without being shown. `--force` shows
-every value: the way out when the re-check itself is wrong.
+真实值再粘贴一次也没关系,进模型前会被改写。
 
-Then talk in placeholders: `curl -H "Authorization: Bearer REDACTED_API_TOKEN" ...`.
-Pasting the real value again is fine; it is rewritten before the model sees it.
+**自动检测**(默认开,`userConfig.autoDetect` 可关)覆盖提示与工具输出:
 
-Auto-detection (`autoDetect` option, default on) covers, in prompts and tool
-results:
+- 按形状:邮箱、IBAN、Luhn 有效卡号、JWT、常见 API key 前缀(`sk-`、`ghp_`、`github_pat_`、`AKIA`、`xox*-`、`glpat-`、`AIza`、`ATATT3`)、`Bearer` 令牌、PEM 私钥;
+- 按键名:`Authorization`、`X-Api-Key`、`Cookie` 等 credential header,以及键含 `password`、`secret`、`token`、`api_key`、`access_key`、`private_key`、`credential` 的 `key=value` / `key: value`(env、YAML、JSON、URL 参数)。
 
-- by shape: e-mail addresses, IBANs, Luhn-valid card numbers, JWTs, common API
-  key prefixes (`sk-`, `ghp_`, `github_pat_`, `AKIA`, `xox*-`, `glpat-`,
-  `AIza`, Atlassian `ATATT3`), `Bearer` tokens, PEM private keys;
-- by name, whatever the value looks like: credential headers (`Authorization`,
-  `Proxy-Authorization`, `X-Api-Key`, `Api-Key`, `X-Auth-Token`,
-  `X-Access-Token`, `Cookie`, `Set-Cookie`) in curl commands, HTTP dumps, trace
-  entries and JSON header maps, and `key=value` / `key: value` pairs whose key
-  contains `password`, `passwd`, `secret`, `token`, `api_key`,
-  `access_key`, `private_key` or `credential` (env files, YAML, properties, URL
-  query strings). References such as `$VAR`, `${...}` and `process.env.X` are
-  left alone, and so are unquoted letters-only values (`Secrets: these ...`,
-  `1Password: Bash`, also `password: changeme`; store such a password with
-  `redact NAME=value`), code (`secrets: Map<...>`, `token: read(...)`) and keys
-  that contain a placeholder.
+一个值被遮过一次后,本会话内以任何形态再现都会被遮,但只整词匹配:存 `check` 不会改写 `usage-check`。
 
-A value caught once is masked everywhere after that, in whatever form it shows
-up again, but only as a whole token: a stored `check` leaves `usage-check` and
-`checked` alone. Names, phone numbers and addresses are not detected; store those
-explicitly.
+## 会话与持久化
 
-## Limits
+- 秘密绑定 session id,存于 `~/.claude/projects/<项目>/<session-id>/redact.enc`,AES-256-CBC + PBKDF2 加密,密钥 256-bit 存 gnome-keyring(`service=claude-code-redact`,`username=aes-key`),经 stdin/env 传递,不进 argv。
+- `claude --resume`、进程重启、headless(Agent SDK、`claude -p`)下占位符照常解析。
+- `/clear`、fork、新会话 → 新 id → 空白开始(自动检测仍会对新出现的值生效;手动存的需重新 `redact`)。
+- 写入原子(temp + `mv`);文件损坏则移到 `redact.enc.corrupt-<ms>` 并空启动。
+- **fail-closed**:解密失败、keyring 不可用时,提示被扣留/工具调用被拒绝,绝不放行明文。
 
-- The permission dialog shows the command as it will run, i.e. with real values (your terminal only).
-- The engine's prompt queue record in the session `.jsonl` keeps the prompt as typed; the user/assistant messages hold placeholders. Prefer `redact NAME=value` over pasting secrets into a working prompt when the local transcript matters.
-- A secret shorter than 4 characters is refused; substring collisions would rewrite too much.
-- A secret containing `REDACTED_` is refused: that prefix marks placeholders, and a value shaped like one would make placeholders ambiguous.
-- Every tool result is scanned once per stored value: cost grows with stored values × output size.
-- `redact.enc` is capped at 4 MiB (roughly 30-40k stored values).
-- macOS only (Keychain, `/usr/bin/openssl`).
-- Tools whose input becomes another model's prompt (`Agent`, `Skill`, `SubagentHandback`, `SendMessage`, T3 Code's `delegate_task`, `t3_thread_send`, `t3_thread_launch`, `create_threads`, `schedule_task`) get placeholders, not values. A subagent runs in the same process and its own tool calls resolve them; another session or another provider cannot, so handing a secret to one does not work, by design.
-- Everything else gets the real value, including what goes to people: a Slack, Jira or Gerrit CLI, a commit message, a rendered page. That is intended (post a customer's e-mail from an order lookup); keeping secrets out of those is up to the person driving the session. The model's own chat reply shows placeholders; have it copy, write or post the value to see it.
-- Context another hook beneath this mod attaches to a tool result (a PostToolUse reminder, another plugin) reaches the model unmasked: the engine keeps a tool result's context from `next()` whole.
-- Messages core adds for a tool call (a Skill's `SKILL.md` content, PostToolUse hook records) are not masked: no hook can read or rewrite them. A result with nothing to mask passes through untouched, so they reach the model; once anything in a result is masked, they are dropped and the model gets only the masked result (a Skill then loads nothing).
-- If masking fails (the session id or the key cannot be read), the prompt is withheld or the tool call denied rather than passed through; Claude Code skips a hook that throws, which would let raw text through.
-- Values that entered the session before redact was active stay readable to the model. The first hook of a session scans the history and warns once per detector version.
+## 限制
 
-## Develop
+- 权限对话框显示的是命令真实执行形态(含真实值,仅你的终端可见)。
+- 会话 `.jsonl` 的 prompt queue 记录保留输入原文——密钥请用单独的 `redact NAME=value` 发送,不要粘进工作提示。
+- 长度 <4 的值拒收;含 `REDACTED_` 的值拒收(占位符前缀保留)。
+- 输入会成为另一个模型提示的工具(`Agent`、`Skill`、`SendMessage` 及子代理类)只拿到占位符——子代理同进程可自行解析,跨会话/跨提供方无法解析,这是设计。
+- 每个工具结果按存储值数扫描一次,开销随 值数 × 输出大小 增长;`redact.enc` 上限 4 MiB。
+- keyring 必须解锁且免交互(WSL 重启后需保持;若锁定,hook 失败关闭,会话退化为内存模式)。
+
+## 路线图
+
+- [x] WSL/Linux:Secret Service(`secret-tool`)后端,Ubuntu 24.04 + gnome-keyring 验证
+- [ ] Windows:DPAPI 后端
+- [ ] macOS:Keychain(`security`)后端
+
+## 测试
 
 ```
-claude --plugin-dir . --debug      # live reload on save
+claude plugin test .    # 检测 + 生命周期,78 项
+```
+
+检测用例集中在 `tests/detect.test.ts`:`MASKED` 表(必须遮蔽)与 `KEPT` 表(必须原样放行)。新增格式 = 加一行测试,先红后改正则。
+
+## 开发
+
+```
+claude --plugin-dir . --debug      # 保存即热重载
 claude plugin validate .
-/plugin-types .                    # writes .claude/types (gitignored), then: npx tsc -p tsconfig.json
 ```
-
-Detection tests run the real module in the mod runtime:
-
-```
-claude plugin test .
-```
-
-`tests/detect.test.ts` holds two tables: `MASKED` (the secret must be gone and a
-placeholder present) and `KEPT` (the text must pass unchanged). A new format is
-one row, red first, then the pattern change.
