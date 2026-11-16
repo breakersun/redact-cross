@@ -15,10 +15,11 @@
 //
 // The secrets survive a restart or a `--resume` of the session: they are kept in
 // <session folder>/redact.enc next to the transcript, encrypted by the system
-// openssl (AES-256-CBC, PBKDF2) with one key from the macOS Keychain, the session
-// id inside and checked on load. The mod runtime's crypto.subtle has only digest,
-// hence openssl. A fork, `/branch` or `/clear` starts a new session id and
-// therefore starts empty.
+// openssl (AES-256-CBC, PBKDF2) with one key from the login keyring — the macOS
+// Keychain (`security`) or the Linux/WSL Secret Service (`secret-tool`) — the
+// session id inside and checked on load. The mod runtime's crypto.subtle has
+// only digest, hence openssl. A fork, `/branch` or `/clear` starts a new session
+// id and therefore starts empty.
 import type { EngineInterface, Register, ToolCallInput } from 'claude-code'
 
 const PREFIX = 'REDACTED_'
@@ -28,11 +29,14 @@ const COMMAND = /^\s*redact\b/i
 const FILE = 'redact.enc'
 const MAX_FILE = 4 * 1024 * 1024 // $.fs.read and $.process.run output stop here
 const KEYCHAIN = ['-s', 'claude-code-redact', '-a', 'aes-key']
+const SECRET_ATTRS = ['service', 'claude-code-redact', 'username', 'aes-key']
 // Tools whose input becomes another model's prompt: placeholders are passed on
 // as they are. A subagent shares this process and resolves them in its own tool
 // calls; another session cannot, by design.
 const MODEL_FACING = /^(?:Agent|Task|Skill|SubagentHandback|SendMessage|mcp__t3-code__(?:delegate_task|t3_thread_send|t3_thread_launch|create_threads|schedule_task))$/
-const OPENSSL = ['/usr/bin/openssl', 'enc', '-aes-256-cbc', '-pbkdf2', '-a', '-A', '-pass', 'env:REDACT_KEY']
+// `openssl` resolves through PATH: /usr/bin/openssl on macOS and Ubuntu, or a
+// newer Homebrew/Git-bundled one. All support enc/aes-256-cbc/pbkdf2.
+const OPENSSL = ['openssl', 'enc', '-aes-256-cbc', '-pbkdf2', '-a', '-A', '-pass', 'env:REDACT_KEY']
 
 type Session = {
   id: string
@@ -83,22 +87,50 @@ function forget(s: Session, placeholder?: string) {
 
 let key: string | undefined
 
+// The keyring backend, probed once: macOS ships `security` (login Keychain),
+// Linux/WSL needs libsecret-tools' `secret-tool` (Secret Service, gnome-keyring).
+type KeyBackend = 'security' | 'secret-tool'
+let backendCache: KeyBackend | undefined
+
+async function keyBackend($: EngineInterface): Promise<KeyBackend> {
+  if (backendCache) return backendCache
+  for (const b of ['security', 'secret-tool'] as KeyBackend[]) {
+    if ((await $.process.run(['sh', '-c', `command -v ${b}`])).exitCode === 0) {
+      backendCache = b
+      return b
+    }
+  }
+  throw new Error('no keyring CLI found: need macOS `security` or Linux libsecret-tools `secret-tool`')
+}
+
 async function readKey($: EngineInterface): Promise<string | undefined> {
-  const r = await $.process.run(['security', 'find-generic-password', ...KEYCHAIN, '-w'])
+  const backend = await keyBackend($)
+  const argv = backend === 'security'
+    ? ['security', 'find-generic-password', ...KEYCHAIN, '-w']
+    : ['secret-tool', 'lookup', ...SECRET_ATTRS]
+  const r = await $.process.run(argv)
   return r.exitCode === 0 && r.stdout.trim() ? r.stdout.trim() : undefined
 }
 
-// One 256-bit key for all sessions, created on first use. It goes to `security`
-// over stdin and to openssl through its environment, never through argv.
+// One 256-bit key for all sessions, created on first use. The hex reaches
+// `security` and `secret-tool` over stdin and openssl through its environment,
+// never through argv. On a locked Secret Service keyring `secret-tool` would
+// prompt; a hook cannot answer, the probe fails and the session runs from
+// memory (same fail-closed path as an unreadable redact.enc).
 async function keyOf($: EngineInterface): Promise<string> {
   if (key) return key
   let hex = await readKey($)
   if (!hex) {
     const fresh = [...crypto.getRandomValues(new Uint8Array(32))].map(b => b.toString(16).padStart(2, '0')).join('')
-    await $.process.run(['security', '-i'], { stdin: `add-generic-password ${KEYCHAIN.join(' ')} -w ${fresh}\n` })
+    const backend = await keyBackend($)
+    if (backend === 'security') {
+      await $.process.run(['security', '-i'], { stdin: `add-generic-password ${KEYCHAIN.join(' ')} -w ${fresh}\n` })
+    } else {
+      await $.process.run(['secret-tool', 'store', '--label=claude-code-redact aes-key', ...SECRET_ATTRS], { stdin: fresh })
+    }
     hex = await readKey($) // another session may have created it first
   }
-  if (!hex || !/^[0-9a-f]{64}$/.test(hex)) throw new Error('no usable key in the Keychain (claude-code-redact / aes-key)')
+  if (!hex || !/^[0-9a-f]{64}$/.test(hex)) throw new Error(`no usable key in the ${backendCache === 'security' ? 'Keychain' : 'Secret Service'} (claude-code-redact / aes-key)`)
   key = hex
   return key
 }
@@ -146,6 +178,8 @@ async function load($: EngineInterface, id: string): Promise<Session> {
     s.warnedFor = blob.warnedFor
   } catch (err) {
     const aside = `${path}.corrupt-${Date.now()}`
+    // POSIX `mv`; a Windows port swaps this (and the atomic rename in save)
+    // for PowerShell Move-Item or the engine's fs primitives.
     const isMoved = (await $.process.run(['mv', path, aside])).exitCode === 0
     if (!isMoved) s.isPersistent = false // never overwrite a file that could still be recovered
     const where = isMoved ? `moved to ${aside}` : 'left in place (move failed); this session runs from memory only'

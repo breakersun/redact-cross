@@ -1,11 +1,11 @@
 {
-  "name": "scriptease-redact",
-  "owner": { "name": "scriptease" },
+  "name": "breakersun-redact",
+  "owner": { "name": "breakersun" },
   "plugins": [
     {
       "name": "redact",
       "source": "./",
-      "description": "Session-scoped secret/PII redaction: placeholders reach the model, real values reach the tools"
+      "description": "Session-scoped secret/PII redaction: placeholders reach the model, real values reach the tools (cross-platform: macOS Keychain / Linux Secret Service)"
     }
   ]
 }

@@ -11,11 +11,24 @@ for the original work belongs to [scriptease](https://github.com/scriptease)
 
 ## Port status
 
-- [x] upstream snapshot imported
-- [ ] `keyOf()` Secret Service (Linux/WSL) backend
+- [x] upstream snapshot imported (`ff47998`)
+- [x] `keyOf()` Secret Service (Linux/WSL) backend — backend probed via
+      `sh -c command -v`; `security` first, then `secret-tool` (libsecret-tools).
+      Key hex reaches both CLIs over stdin, openssl through `REDACT_KEY` env —
+      never argv.
+- [x] cross-platform openssl invocation — `openssl` resolved through PATH
+      instead of the hardcoded `/usr/bin/openssl`; ciphertext of a Homebrew
+      3.x openssl decrypts with /usr/bin/openssl 3.0 and vice versa (verified).
 - [ ] `keyOf()` DPAPI (Windows) backend
-- [ ] cross-platform openssl invocation
-- [ ] `mv` → engine fs primitives
+- [ ] Windows: `mv`/atomic rename via PowerShell or engine fs primitives
+- [ ] Windows end-to-end test
+
+Validated on Ubuntu 24.04 (WSL2, systemd, gnome-keyring unlocked):
+`secret-tool` store/lookup/clear non-interactive, openssl roundtrip both ways,
+plugin test suite 78/78 pass. One environment caveat: after `wsl --shutdown`,
+the Secret Service keyring must still be unlocked without an interactive
+prompt — if it ever locks, hooks fail closed (session runs from memory) rather
+than leaking.
 
 ---
 
