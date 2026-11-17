@@ -1,6 +1,6 @@
 # redact-cross
 
-<p align="center"><img src="assets/hero-banner.jpg" alt="redact-cross" width="720"></p>
+<p align="center"><img src="assets/hero.jpg" alt="redact-cross" width="720"></p>
 
 Claude Code 的会话级密钥/PII 遮蔽插件(mod)。模型只看到 `REDACTED_<NAME>` 占位符;真实值只在工具执行时到达工具,从不进入模型上下文。
 
